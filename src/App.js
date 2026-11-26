@@ -102,17 +102,23 @@ function App() {
 
         beacon.update("v0.1.6",set_connecting_stack).then(async (successful)=>{
 
+          // Take the "Connecting..." / "Uploading Firmware..." status off
+          // the stack either way.
+          set_connecting_stack(prev => {
+            const copy = [...prev]
+            copy.pop()
+            return copy
+          })
+
           if (!successful) {
-            try {
-              set_connecting_stack(prev => {
-                const copy = [...prev]
-                copy.pop()
-                return copy
-              })
-              beacon.port.close()
-            } catch (err) {
-              console.log(err)
-            }
+            // Fail safe: the Beacon stays connected and usable on its
+            // existing firmware (update() already restored the port to
+            // sketch speed). The old code closed the port here, which
+            // left a dead Beacon in the list that could not interface
+            // at all. Show a real warning instead of failing silently.
+            set_connecting_stack(prev => [...prev, (
+              <p className='text-xl text-red-600 mt-3.5'>Beacon {beaconId}: firmware update failed, it is connected on its existing firmware. It is safe to use, or unplug it and reconnect to try the update again.</p>
+            )])
           }
 
           if (beacon.readingFlag == false) {beacon.startReading(set_global_buffer)}
@@ -123,12 +129,6 @@ function App() {
           else {beacon.sendCmd("Idle")}
 
           set_beacons(prev => [...prev, beacon]);
-
-          set_connecting_stack(prev => {
-            const copy = [...prev]
-            copy.pop()
-            return copy
-          })
 
         })
 
