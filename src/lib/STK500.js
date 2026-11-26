@@ -33,6 +33,7 @@ export class STK500 {
     this.writer = writer
     this.reader = reader
     this.uploading_buffer = uploading_buffer
+    this.inflightRead = null; // a reader.read() promise that timed out on our side but is still pending
   }
 
   // Toggling DTR/RTS is how a USB-serial chip physically resets the
@@ -42,13 +43,57 @@ export class STK500 {
     await this.port.setSignals({ dataTerminalReady: false, requestToSend: false });
     await new Promise(r => setTimeout(r, 100)); // hold reset briefly
     await this.port.setSignals({ dataTerminalReady: true, requestToSend: true });
-    await new Promise(r => setTimeout(r, 100)); // let bootloader boot up
+    await new Promise(r => setTimeout(r, 200)); // let bootloader boot up
+  }
+
+  // Read one chunk from the serial port, giving up after `timeoutMs`.
+  // A WebSerial read() that we stop waiting on is still pending, so we
+  // keep it and reuse it next time instead of stacking up reads.
+  // Returns the chunk, or null when the wait timed out.
+  async _readChunk(timeoutMs) {
+    if (!this.inflightRead) {
+      this.inflightRead = this.reader.read();
+    }
+    let timer = null;
+    try {
+      const result = await Promise.race([
+        this.inflightRead,
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), timeoutMs); }),
+      ]);
+      if (result === null) {
+        return null; // timed out, the read is still pending for next time
+      }
+      this.inflightRead = null;
+      if (!result || result.done) {
+        throw new Error("Serial port closed while reading");
+      }
+      return result.value || new Uint8Array(0);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  // Discard whatever is sitting in the input buffer (for example a late
+  // version reply or Red/Blue lines from the running sketch) so stale
+  // bytes cannot desync the bootloader handshake. Stops once the line
+  // has been quiet for `quietMs`, or after `maxMs` overall.
+  async flushInput(quietMs = 250, maxMs = 2000) {
+    this.leftover = new Uint8Array(0);
+    const start = performance.now();
+    while (performance.now() - start < maxMs) {
+      const chunk = await this._readChunk(quietMs);
+      if (chunk === null) {
+        return; // quiet for quietMs, buffer is clear
+      }
+    }
   }
 
   // Low-level: read exactly `n` bytes back from the Arduino.
   // Serial data can arrive in small unpredictable chunks, so we
   // keep reading until we have as many bytes as we asked for.
-  async readBytes(n) {
+  // Gives up after `timeoutMs` instead of waiting forever, which is
+  // what used to hang the upload when the bootloader window was missed.
+  async readBytes(n, timeoutMs = 1500) {
     const result = new Uint8Array(n);
     let received = 0;
 
@@ -60,11 +105,19 @@ export class STK500 {
       received += take;
     }
 
+    const deadline = performance.now() + timeoutMs;
     while (received < n) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) {
+        throw new Error("Timed out waiting for the bootloader to respond");
+      }
 
-      const { value } = await this.reader.read();
+      const value = await this._readChunk(remaining);
 
-      if (!value || value == null) continue;
+      if (value === null) {
+        throw new Error("Timed out waiting for the bootloader to respond");
+      }
+      if (!value || value.length === 0) continue;
 
       const need = n - received;
       if (value.length > need) {
@@ -104,13 +157,17 @@ export class STK500 {
 
   // Ping the bootloader until it responds. Needed right after reset,
   // since there's a small window where it's not listening yet.
-  async sync(tries = 10) {
+  // A failed attempt can mean a stale byte was in the buffer, so each
+  // retry consumes a little more junk and tries again, with a short
+  // pause so we keep pinging for a few seconds in total.
+  async sync(tries = 25) {
     for (let i = 0; i < tries; i++) {
       try {
         await this.sendCommand([GET_SYNC]);
         return; // success!
       } catch (err) {
         // ignore and try again
+        await new Promise(r => setTimeout(r, 50));
       }
     }
     throw new Error("Could not sync with bootloader");
