@@ -1,7 +1,7 @@
 {
   "name": "beacon-console",
   "version": "0.1.0",
-  "homepage": "https://jaxson098.github.io/Beacon-Console/",
+  "homepage": "https://edueverything.github.io/Beacon-Console/",
   "private": true,
   "dependencies": {
     "@testing-library/dom": "^10.4.1",
